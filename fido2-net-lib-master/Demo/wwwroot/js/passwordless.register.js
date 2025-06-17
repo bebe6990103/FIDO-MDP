@@ -5,11 +5,12 @@ async function handleRegisterSubmit(event) {
     event.preventDefault();
 
     let username = this.username.value;
-    let displayName = this.displayName.value + ";TEST"; // 測試用
+    let displayName = this.displayName.value; // 測試用
 
     // possible values: none, direct, indirect
     // none 自驗式(瀏覽器驗證)，direct 直接驗證，indirect 間接式驗證
-    let attestation_type = "none";
+    // let attestation_type = "none";
+    let attestation_type = "direct";
 
     // platform: 內建於裝置中的認證器
     // cross-platform: 只能使用外部認證器來進行身份驗證

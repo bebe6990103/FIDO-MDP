@@ -4,6 +4,7 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Rewrite;
 using Microsoft.AspNetCore.Authentication.Cookies;   // ★ 新增
 using Microsoft.AspNetCore.Http;                     // SameSiteMode
+using System.Net.Http.Headers; // for metadata
 
 namespace Fido2Demo;
 
@@ -56,15 +57,23 @@ public class Startup
             options.ServerName = "FIDO2 Test";
             options.Origins = Configuration.GetSection("fido2:origins").Get<HashSet<string>>();
             options.TimestampDriftTolerance = Configuration.GetValue<int>("fido2:timestampDriftTolerance");
-            options.MDSCacheDirPath = Configuration["fido2:MDSCacheDirPath"];
+            options.MDSCacheDirPath = Configuration["fido2:MDSCacheDirPath"]; // 下載後快取的資料夾
             options.BackupEligibleCredentialPolicy = Configuration.GetValue<Fido2Configuration.CredentialBackupPolicy>("fido2:backupEligibleCredentialPolicy");
             options.BackedUpCredentialPolicy = Configuration.GetValue<Fido2Configuration.CredentialBackupPolicy>("fido2:backedUpCredentialPolicy");
         })
-        .AddCachedMetadataService(config =>
+        .AddCachedMetadataService(metadata => // 額外的mds設定
         {
-            config.AddFidoMetadataRepository(httpClientBuilder =>
+            metadata.AddFidoMetadataRepository(http =>
             {
-                //TODO: any specific config you want for accessing the MDS
+                // 用 ConfigureHttpClient 設定真正的 HttpClient
+                http.ConfigureHttpClient(client =>
+                {
+                    client.BaseAddress = new Uri("https://mds.fidoalliance.org/");
+                    client.Timeout = TimeSpan.FromSeconds(30);           // (可選) 逾時
+                });
+
+                // (可選) 例如 Proxy、重試 Policy 都在這裡加
+                // http.AddPolicyHandler(retryPolicy);
             });
         });
     }

@@ -6,8 +6,6 @@ using Fido2NetLib.Objects;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.Cookies;
 using System.Security.Claims;
-
-
 using Microsoft.AspNetCore.Mvc;
 
 using Microsoft.Data.Sqlite; // 用這個
@@ -19,7 +17,7 @@ public class MyController : Controller
 {
 
     private IFido2 _fido2;
-    public static IMetadataService _mds;
+
     public static readonly DevelopmentInMemoryStore DemoStorage = new();
     public static readonly Dictionary<string, string> EmailByUser = new();
 
@@ -48,6 +46,9 @@ public class MyController : Controller
     {
         try
         {
+            
+            if (string.IsNullOrWhiteSpace(attType))
+            attType = "direct";                         // ★ 新增：預設 direct
 
             if (string.IsNullOrEmpty(username))
             {
@@ -92,6 +93,7 @@ public class MyController : Controller
 
             // 5. return options to client
             return Json(options);
+            
         }
         catch (Exception e)
         {
@@ -142,6 +144,10 @@ public class MyController : Controller
                 AttestationClientDataJson = credential.AttestationClientDataJson, // 客戶端數據的 JSON
                 DevicePublicKeys = [credential.DevicePublicKey] // 設備的公鑰
             });
+
+            // 把 AAGUID 與使用者寫入 Authenticator 資料表
+            string userHandleB64 = Convert.ToBase64String(options.User.Id);
+            WriteAAGUIDLog(userHandleB64, credential.AaGuid.ToString());
 
             // 4. return "ok" to the client
             return Json(credential);
@@ -206,10 +212,11 @@ public class MyController : Controller
     [Route("/makeAssertion")]
     public async Task<JsonResult> MakeAssertion([FromBody] AuthenticatorAssertionRawResponse clientResponse, CancellationToken cancellationToken)
     {
+
         string userHandleStr = "";         // for DB 先宣告在外部
         string clientChallengeB64Url = "";   // for DB 先宣告在外部
         string challengeClient = "";
-        //bool rpIdMatch = false;
+        bool rpIdMatch = false;
         uint signCount = 0;
         bool upFlag = false;
         bool uvFlag = false;
@@ -218,6 +225,7 @@ public class MyController : Controller
         int challengeRisk = 2;
         uint signCountRisk = 2;
         int accRisk = 2;
+        int authenticatorRisk = 2;
 
         try
         {
@@ -236,7 +244,7 @@ public class MyController : Controller
             var authData = AuthenticatorData.Parse(clientResponse.Response.AuthenticatorData);
 
             // 3‑1  RP‑ID 比對結果 (bool) ------------
-            //rpIdMatch = options.RpId == "localhost";
+            rpIdMatch = options.RpId == "localhost";
             //Console.WriteLine("RP ID: " + options.RpId);  // 這行就會顯示你的 RP ID
 
             // 3‑2  Signature Counter ---------------
@@ -330,15 +338,16 @@ public class MyController : Controller
             // 計算登入風險
             frequencyRisk = GetFrequencyRisk(userHandleStr);
             challengeRisk = GetChallengeRisk(challengeClient);
-            signCountRisk = GetSignCountRisk(signCount);
+            signCountRisk = GetSignCountRisk(userHandleStr, signCount);
             accRisk = GetAccountRisk(frequencyRisk, challengeRisk);
+            authenticatorRisk = await GetAuthenticatorRiskAsync(userHandleStr);
 
             // Read Q-table, 並選出決策
 
             // int action = BestAction(0, true, true, false, 0); // 直接指定值 (測試用)
             int action = BestAction(accRisk, upFlag, uvFlag, hasUnknownExt, (int)signCountRisk);
 
-            action = 1; // 指定action (測試用)
+            action = 0; // 指定action (測試用)
 
             // 依 action 採取對應流程
 
@@ -348,56 +357,56 @@ public class MyController : Controller
                     break;
 
                 case 1:   // 需要 MFA
-                {
-                    WriteLog(userHandleStr, challengeClient, accRisk, signCountRisk,
-                            uvFlag, upFlag, hasUnknownExt, frequencyRisk,
-                            challengeRisk, "MFA", "Success");
-
-                    // 1. 產生 6 碼 OTP
-                    string otp = OtpUtil.GenerateOtp(6);
-
-                    // 2. 找出使用者的 e-mail（DemoStorage 沒存就從自訂字典拿）
-                    string email = null;
-
-                    if (!EmailByUser.TryGetValue(userHandleStr, out email))
                     {
-                        // userHandleStr 查不到 → 嘗試還原 username
-                        string username = Encoding.UTF8.GetString(
-                                            Convert.FromBase64String(userHandleStr));
+                        WriteLog(userHandleStr, challengeClient, accRisk, authenticatorRisk, rpIdMatch, signCount, signCountRisk,
+                                uvFlag, upFlag, hasUnknownExt, frequencyRisk,
+                                challengeRisk, "MFA", "Success");
 
-                        EmailByUser.TryGetValue(username, out email);
+                        // 1. 產生 6 碼 OTP
+                        string otp = OtpUtil.GenerateOtp(6);
+
+                        // 2. 找出使用者的 e-mail（DemoStorage 沒存就從自訂字典拿）
+                        string email = null;
+
+                        if (!EmailByUser.TryGetValue(userHandleStr, out email))
+                        {
+                            // userHandleStr 查不到 → 嘗試還原 username
+                            string username = Encoding.UTF8.GetString(
+                                                Convert.FromBase64String(userHandleStr));
+
+                            EmailByUser.TryGetValue(username, out email);
+                        }
+
+                        if (string.IsNullOrWhiteSpace(email))
+                        {
+                            // 真的沒有 e-mail，就直接拒絕
+                            return Json(new { status = "error", message = "no_email_on_record" });
+                        }
+
+                        // 3. 寄信（可包 try/catch）
+                        try
+                        {
+                            OtpUtil.SendOtpEmail(email, otp);
+                        }
+                        catch (Exception ex)
+                        {
+                            // 記 log，回傳錯誤
+                            Console.WriteLine($"❌  SendOtpEmail 失敗：{ex}");
+                            return Json(new { status = "error", message = "otp_send_failed" });
+                        }
+
+                        // 4. 把 OTP + 使用者 + 到期時間塞進 Session，給 /verifyOtp 用
+                        HttpContext.Session.SetString("pendingOtpUser", userHandleStr);
+                        HttpContext.Session.SetString("pendingOtpCode", otp);
+                        HttpContext.Session.SetString("pendingOtpExpiry",
+                            DateTime.UtcNow.AddMinutes(3).ToString("O"));   // ISO-8601
+
+                        // 5. 回前端：跳出 OTP 輸入畫面
+                        return Json(new { status = "mfa_required" });
                     }
-
-                    if (string.IsNullOrWhiteSpace(email))
-                    {
-                        // 真的沒有 e-mail，就直接拒絕
-                        return Json(new { status = "error", message = "no_email_on_record" });
-                    }
-
-                    // 3. 寄信（可包 try/catch）
-                    try
-                    {
-                        OtpUtil.SendOtpEmail(email, otp);
-                    }
-                    catch (Exception ex)
-                    {
-                        // 記 log，回傳錯誤
-                        Console.WriteLine($"❌  SendOtpEmail 失敗：{ex}");
-                        return Json(new { status = "error", message = "otp_send_failed" });
-                    }
-
-                    // 4. 把 OTP + 使用者 + 到期時間塞進 Session，給 /verifyOtp 用
-                    HttpContext.Session.SetString("pendingOtpUser",  userHandleStr);
-                    HttpContext.Session.SetString("pendingOtpCode",  otp);
-                    HttpContext.Session.SetString("pendingOtpExpiry",
-                        DateTime.UtcNow.AddMinutes(3).ToString("O"));   // ISO-8601
-
-                    // 5. 回前端：跳出 OTP 輸入畫面
-                    return Json(new { status = "mfa_required" });
-                }
 
                 case 2:   // 直接拒絕
-                    WriteLog(userHandleStr, challengeClient, accRisk, signCountRisk,
+                    WriteLog(userHandleStr, challengeClient, accRisk, authenticatorRisk, rpIdMatch, signCount, signCountRisk,
                             uvFlag, upFlag, hasUnknownExt, frequencyRisk,
                             challengeRisk, "REJECT", "Success");
 
@@ -406,20 +415,20 @@ public class MyController : Controller
             }
 
 
-            WriteLog(userHandleStr, challengeClient, accRisk, signCountRisk, uvFlag, upFlag, hasUnknownExt, frequencyRisk, challengeRisk, "ACCEPT", "Success");
+            WriteLog(userHandleStr, challengeClient, accRisk, authenticatorRisk, rpIdMatch, signCount, signCountRisk, uvFlag, upFlag, hasUnknownExt, frequencyRisk, challengeRisk, "ACCEPT", "Success");
 
             // 7. return OK to client
             return Json(res);
         }
         catch (Exception e)
         {
-            WriteLog(userHandleStr, challengeClient, accRisk, signCountRisk, uvFlag, upFlag, hasUnknownExt, frequencyRisk, challengeRisk, "None", "Fail");
+            WriteLog(userHandleStr, challengeClient, accRisk, authenticatorRisk, rpIdMatch, signCount, signCountRisk, uvFlag, upFlag, hasUnknownExt, frequencyRisk, challengeRisk, "None", "Fail");
             return Json(new { Status = "error", ErrorMessage = FormatException(e) });
         }
     }
 
     // 提供一個共用方法
-    private void WriteLog(string userHandleStr, string challengeFromClient, int accRisk, uint signCountRisk, bool uvFlag, bool upFlag, bool hasUnknownExt, int frequencyRisk, int challengeRisk, string action, string result)
+    private void WriteLog(string userHandleStr, string challengeFromClient, int accRisk, int authenticatorRisk, bool rpIdMatch, uint signCount, uint signCountRisk, bool uvFlag, bool upFlag, bool hasUnknownExt, int frequencyRisk, int challengeRisk, string action, string result)
     {
         string connStr = @"Data Source=C:\source code\fido2-net-lib-master\fido2-net-lib-master\Demo\fidoLog.db";
         Console.WriteLine($"========== [WriteLog] 開始寫入 ==========");
@@ -436,12 +445,13 @@ public class MyController : Controller
                 using (var cmd = conn.CreateCommand())
                 {
                     cmd.CommandText = @"
-                        INSERT INTO FidoAuthLog (userHandle, challenge, accRisk, verifyTime, result, signCountRisk, uvFlag, upFlag, frequencyRisk, challengeRisk, hasUnknownExt, action)
-                        VALUES (@userHandle, @challenge, @accRisk, @verifyTime, @result, @signCountRisk, @uvFlag, @upFlag, @frequencyRisk, @challengeRisk, @hasUnknownExt, @action)";
+                        INSERT INTO FidoAuthLog (userHandle, challenge, accRisk, authenticatorRisk, rpIdMatch, preCounter, verifyTime, result, signCountRisk, uvFlag, upFlag, frequencyRisk, challengeRisk, hasUnknownExt, action)
+                        VALUES (@userHandle, @challenge, @accRisk, @authenticatorRisk, @rpIdMatch, @preCounter, @verifyTime, @result, @signCountRisk, @uvFlag, @upFlag, @frequencyRisk, @challengeRisk, @hasUnknownExt, @action)";
                     cmd.Parameters.AddWithValue("@userHandle", userHandleStr ?? "");
                     cmd.Parameters.AddWithValue("@challenge", challengeFromClient ?? "");
                     cmd.Parameters.AddWithValue("@accRisk", accRisk);
-                    //cmd.Parameters.AddWithValue("@rpIdMatch", rpIdMatch ? 1 : 0);
+                    cmd.Parameters.AddWithValue("@rpIdMatch", rpIdMatch ? 1 : 0);
+                    cmd.Parameters.AddWithValue("@preCounter", signCount);
                     cmd.Parameters.AddWithValue("@signCountRisk", signCountRisk);
                     cmd.Parameters.AddWithValue("@uvFlag", uvFlag ? 1 : 0);
                     cmd.Parameters.AddWithValue("@upFlag", upFlag ? 1 : 0);
@@ -449,7 +459,7 @@ public class MyController : Controller
                     cmd.Parameters.AddWithValue("@result", result ?? "");
                     cmd.Parameters.AddWithValue("@frequencyRisk", frequencyRisk);
                     cmd.Parameters.AddWithValue("@challengeRisk", challengeRisk);
-                    //cmd.Parameters.AddWithValue("@verifyTime", DateTime.UtcNow.ToString("o")); // ISO 8601 格式
+                    cmd.Parameters.AddWithValue("@authenticatorRisk", authenticatorRisk);
                     cmd.Parameters.AddWithValue("@verifyTime", TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, TimeZoneInfo.FindSystemTimeZoneById("Taipei Standard Time")).ToString("o"));
                     cmd.Parameters.AddWithValue("@action", action);
 
@@ -466,6 +476,44 @@ public class MyController : Controller
         finally
         {
             Console.WriteLine("========== [WriteLog] 結束 ==========\n");
+        }
+    }
+
+    private void WriteAAGUIDLog(string userHandleStr, string aaguid)
+    {
+        string connStr = @"Data Source=C:\source code\fido2-net-lib-master\fido2-net-lib-master\Demo\fidoLog.db";
+        Console.WriteLine($"========== [WriteLog] 開始寫入 ==========");
+
+        try
+        {
+            Console.WriteLine($"[WriteLog] 準備連接資料庫：{connStr}");
+
+            using (var conn = new SqliteConnection(connStr))
+            {
+                conn.Open();
+                Console.WriteLine("[WriteLog] 資料庫連線成功");
+
+                using (var cmd = conn.CreateCommand())
+                {
+                    cmd.CommandText = @"
+                        INSERT INTO Authenticator (userHandle, aaguid)
+                        VALUES (@userHandle, @aaguid)";
+                    cmd.Parameters.AddWithValue("@userHandle", userHandleStr ?? "");
+                    cmd.Parameters.AddWithValue("@aaguid", aaguid ?? "");
+
+                    int rows = cmd.ExecuteNonQuery();
+                    Console.WriteLine($"[WriteAAGUIDLog] 寫入成功，共 {rows} 筆。");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[WriteAAGUIDLog] 資料庫寫入失敗：{ex}");
+            System.Diagnostics.Debug.WriteLine($"[WriteAAGUIDLog] 資料庫寫入失敗：{ex}");
+        }
+        finally
+        {
+            Console.WriteLine("========== [WriteAAGUIDLog] 結束 ==========\n");
         }
     }
 
@@ -507,23 +555,44 @@ public class MyController : Controller
         return 0;                   // Low
     }
 
-    private static uint GetSignCountRisk(uint signCount) // 需再調整
+    private static uint GetSignCountRisk(string userHandle, uint current)
     {
-        if (signCount == 0)
+        string connStr = @"Data Source=C:\source code\fido2-net-lib-master\fido2-net-lib-master\Demo\fidoLog.db";
+        uint? prev = null;
+
+        // 嘗試查詢前一次的 signCount（preCounter）
+        using (var conn = new SqliteConnection(connStr))
         {
-            // 從沒增加 → 高風險
-            return 2;
+            conn.Open();
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = @"
+                    SELECT preCounter
+                    FROM FidoAuthLog
+                    WHERE userHandle = @userHandle
+                    ORDER BY verifyTime DESC";  // 抓「上一筆」紀錄
+
+                cmd.Parameters.AddWithValue("@userHandle", userHandle);
+                var result = cmd.ExecuteScalar();
+
+                if (result != null && result != DBNull.Value)
+                {
+                    prev = Convert.ToUInt32(result);
+                }
+            }
         }
-        else if (signCount < 5)
-        {
-            // 很少增加 → 中風險
-            return 1;
-        }
-        else
-        {
-            // 正常遞增 → 低風險
-            return 0;
-        }
+
+        // ── 風險判斷邏輯 ─────────────────────
+        if (prev is null)
+            return 0;  // 第一次登入，沒有前值可比對 → 低風險
+
+        uint last = prev.Value;
+
+        if (current == 0 && last > 0) return 1;  // 歸零但以前非零 → 可疑
+        if (current < last) return 2;           // 倒退 → 高風險
+        if (current == last) return 1;          // 沒遞增 → 中風險
+
+        return 0;  // 正常遞增 → 低風險
     }
 
     int GetFrequencyRisk(string userHandle)
@@ -598,6 +667,74 @@ public class MyController : Controller
         return act;   // 0 = ACCEPT, 1 = MFA, 2 = REJECT
     }
 
+    private async Task<int> GetAuthenticatorRiskAsync(string userHandle)
+    {
+        const string connStr =
+            @"Data Source=C:\source code\fido2-net-lib-master\fido2-net-lib-master\Demo\fidoLog.db";
+
+        // ---------- 1) 撈出該 user 最新的 AAGUID ----------
+        Guid aaguid = Guid.Empty;
+
+        using (var conn = new SqliteConnection(connStr))
+        {
+            await conn.OpenAsync();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"
+                SELECT aaguid
+                FROM   Authenticator
+                WHERE  userHandle = @uh
+                ORDER  BY rowid DESC      -- 最新一筆
+                LIMIT 1";
+            cmd.Parameters.AddWithValue("@uh", userHandle);
+
+            var obj = await cmd.ExecuteScalarAsync();
+            if (obj is not null && Guid.TryParse(obj.ToString(), out var g))
+                aaguid = g;
+        }
+
+        if (aaguid == Guid.Empty)
+            return 2;                        // 找不到 → 高風險
+
+        // ---------- 2) 向 DI 取出 IMetadataService ----------
+        var mds = HttpContext.RequestServices
+                            .GetRequiredService<IMetadataService>();
+
+        var entry = await mds.GetEntryAsync(aaguid);
+        if (entry is null)
+            return 2;                        // 未知 AAGUID → 高風險
+
+        var status = entry.GetLatestStatusReport()?.Status
+                    ?? AuthenticatorStatus.NOT_FIDO_CERTIFIED;
+
+        // ---------- 3) 對應成風險分數 ----------
+        return status switch
+        {
+            // 高風險
+            AuthenticatorStatus.NOT_FIDO_CERTIFIED or
+            AuthenticatorStatus.REVOKED or
+            AuthenticatorStatus.USER_VERIFICATION_BYPASS or
+            AuthenticatorStatus.ATTESTATION_KEY_COMPROMISE or
+            AuthenticatorStatus.USER_KEY_REMOTE_COMPROMISE or
+            AuthenticatorStatus.USER_KEY_PHYSICAL_COMPROMISE  => 2,
+
+            // 中風險
+            AuthenticatorStatus.SELF_ASSERTION_SUBMITTED or
+            AuthenticatorStatus.FIDO_CERTIFIED or
+            AuthenticatorStatus.UPDATE_AVAILABLE              => 1,
+
+            // 低風險 (L1~L3+, FIPS)
+            AuthenticatorStatus.FIDO_CERTIFIED_L1 or
+            AuthenticatorStatus.FIDO_CERTIFIED_L1plus or
+            AuthenticatorStatus.FIDO_CERTIFIED_L2 or
+            AuthenticatorStatus.FIDO_CERTIFIED_L2plus or
+            AuthenticatorStatus.FIDO_CERTIFIED_L3 or
+            AuthenticatorStatus.FIDO_CERTIFIED_L3plus         => 0,
+
+            // 其他未知狀態
+            _                                                 => 2
+        };
+    }
+
     [HttpGet]
     [Route("/debug/user/{username}/credentials")]
     public JsonResult GetUserCredentials(string username)
@@ -637,8 +774,8 @@ public class MyController : Controller
     public async Task<JsonResult> VerifyOtp([FromForm] string otp)   // 只收 OTP，本例使用者帳號放在 Session
     {
         // ---- 1. 取出暫存資料 ----
-        var username  = HttpContext.Session.GetString("pendingOtpUser");
-        var code      = HttpContext.Session.GetString("pendingOtpCode");
+        var username = HttpContext.Session.GetString("pendingOtpUser");
+        var code = HttpContext.Session.GetString("pendingOtpCode");
         var expiryStr = HttpContext.Session.GetString("pendingOtpExpiry");
 
         // Session 過期／不存在
@@ -663,12 +800,57 @@ public class MyController : Controller
         {
             new Claim(ClaimTypes.Name, username)
         };
-        var identity  = new ClaimsIdentity(claims, CookieAuthenticationDefaults.AuthenticationScheme);
+        var identity = new ClaimsIdentity(claims, CookieAuthenticationDefaults.AuthenticationScheme);
         var principal = new ClaimsPrincipal(identity);
 
         await HttpContext.SignInAsync(CookieAuthenticationDefaults.AuthenticationScheme, principal);
 
         return Json(new { status = "ok" });
     }
+    
+    [HttpGet("/status/{aaguid}")]
+    public async Task<IActionResult> GetAuthenticatorStatus(Guid aaguid,[FromServices] Fido2NetLib.IMetadataService metadataService)
+    {
+        var entry = await metadataService.GetEntryAsync(aaguid);
+        if (entry is null)
+            return NotFound("Unknown AAGUID");
+
+        var stmt   = entry.MetadataStatement;
+        var latest = entry.GetLatestStatusReport();
+
+        return Ok(new
+        {
+            // 基本識別
+            AAGUID       = aaguid,
+            AAID         = entry.Aaid,
+            Description  = stmt?.Description,
+            Icon         = stmt?.Icon,                 // data:image/png;base64,…
+
+            // 認證等級與狀態
+            Status = latest?.Status.ToString() ?? "N/A",
+            //CertLevel    = stmt?.CertificationLevel,   // 4.0.2 版才有；beta3 可忽略
+            TimeOfLastStatusChange = entry.TimeOfLastStatusChange,
+
+            // 支援能力（範例挑幾個常用欄位）
+            Upv = stmt?.Upv?.Select(u => $"{u.Major}.{u.Minor}"),
+            KeyProtection= stmt?.KeyProtection,
+            MatcherProtection = stmt?.MatcherProtection,
+            AttestationTypes  = stmt?.AttestationTypes,
+
+            // 生物辨識（若有）
+            BiometricStatus = entry.BiometricStatusReports?.Select(r => new {
+                EffectiveDate = r.EffectiveDate
+            }),
+
+            // 擴充：最新 StatusReport 的其他欄位
+            LatestReport = latest is null ? null : new {
+                latest.Status,
+                latest.EffectiveDate,
+                latest.Certificate,
+                latest.Url
+            }
+        });
+    }
+    
 
 }
