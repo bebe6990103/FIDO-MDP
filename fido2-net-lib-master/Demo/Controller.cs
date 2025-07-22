@@ -347,7 +347,7 @@ public class MyController : Controller
             // int action = BestAction(0, true, true, false, 0); // 直接指定值 (測試用)
             int action = BestAction(accRisk, upFlag, uvFlag, hasUnknownExt, (int)signCountRisk);
 
-            action = 0; // 指定action (測試用)
+            //action = 1; // 指定action (測試用)
 
             // 依 action 採取對應流程
 
