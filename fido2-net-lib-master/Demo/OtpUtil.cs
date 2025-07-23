@@ -20,7 +20,7 @@ namespace Fido2Demo
             using var smtp = new SmtpClient("smtp.gmail.com", 587)
             {
                 // 填上  SMTP PASSWORD
-                // Credentials = new NetworkCredential("611235113@gms.ndhu.edu.tw", "SMTP PASSWORD"),
+                Credentials = new NetworkCredential("611235113@gms.ndhu.edu.tw", "Gmial application password here"),
                 EnableSsl = true
             };
 
